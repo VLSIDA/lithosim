@@ -14,3 +14,9 @@ pp. 2837–2852](https://users.soe.ucsc.edu/~milanfar/publications/journal/Micro
 The OPC just does a simulated annealing algorithm to minimize error
 between the target mask and the simulated mask. It does not convert
 the pixel-based mask into a manufacturable mask.
+
+## Example Results
+
+![Mask](tests/tiny.pbm)
+![Aerial](results/tiny-aerial-90nm.pbm)
+![Contours](results/tiny-contours-90nm.pbm)
