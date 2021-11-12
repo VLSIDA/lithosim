@@ -19,8 +19,10 @@ the pixel-based mask into a manufacturable mask.
 
 ### Simulation
 Mask, Aerial Image, Contours
+
 <img src="examples/tiny-mask-90nm.jpg" alt="Mask (target)" width="200"/><img src="examples/tiny-aerial-90nm.jpg" alt="Aerial Image" width="200"/><img src="examples/tiny-contours-90nm.jpg" alt="Contours" width="200"/>
 
 ### OPC
-OPC'ed Mask, OPC Aerial Image, OPC Contours
+OPC'ed Mask (high cost!), OPC Aerial Image, OPC Contours
+
 <img src="examples/tiny-opc-mask-90nm.jpg" alt="OPC Mask" width="200"/><img src="examples/tiny-opc-aerial-90nm.jpg" alt="OPC Aerial Image" width="200"/><img src="examples/tiny-opc-contours-90nm.jpg" alt="OPC Contours" width="200"/>
