@@ -119,6 +119,10 @@ $(L_OBJS): $(L_SRCS) $(HDRS)
 	$(CC) -c $(CFLAGS) -Wno-unused-function -Wno-unused-label \
                  -Wno-implicit-function-declaration $<
 
+test: bar via tiny small 
+
+opc: baropc viaopc tinyopc smallopc
+
 bar: $(TARGET)
 	./$(TARGET) 8 tests/2_thick_bar7.pbm results/bar-aerial.pnm results/bar-contours.pnm
 
