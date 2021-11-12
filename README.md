@@ -17,10 +17,10 @@ the pixel-based mask into a manufacturable mask.
 
 ## Example Results
 
-![Mask (target)](examples/tiny-mask-90nm.pbm)
-![Aerial](examples/tiny-aerial-90nm.pbm)
-![Contours](examples/tiny-contours-90nm.pbm)
+![Mask (target)](examples/tiny-mask-90nm.jpg)
+![Aerial](examples/tiny-aerial-90nm.jpg)
+![Contours](examples/tiny-contours-90nm.jpg)
 
-![OPC Mask](examples/tiny-opc-90nm.pbm)
-![OPC Aerial](examples/tiny-opc-aerial-90nm.pbm)
-![OPC Contours](examples/tiny-opc-cotours-90nm.pbm)
+![OPC Mask](examples/tiny-opc-90nm.jpg)
+![OPC Aerial](examples/tiny-opc-aerial-90nm.jpg)
+![OPC Contours](examples/tiny-opc-cotours-90nm.jpg)
