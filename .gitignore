@@ -5,3 +5,4 @@ __pycache__/
 lithosim
 results/
 jinc.pnm
+benchmarks/

@@ -26,6 +26,7 @@ import numpy as np
 from scipy.special import j1 as bessj1
 from scipy.signal import fftconvolve
 from scipy.ndimage import gaussian_filter
+from skimage import measure
 from PIL import Image
 
 
@@ -125,6 +126,73 @@ def load_bitmap_mask(filename):
     return mask
 
 
+def load_glp(filename, nm_per_pixel=1.0, padding=0):
+    """Load an ICCAD 2013 .glp layout file.
+
+    GLP files contain RECT and PGON entries with coordinates in nm.
+    Format:
+        RECT N M1  x y width height
+        PGON N M1  x1 y1 x2 y2 ... xN yN
+    """
+    rects = []
+    pgons = []
+
+    with open(filename) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('RECT'):
+                parts = line.split()
+                # RECT N M1 x y w h
+                x, y, w, h = float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+                rects.append((x, y, w, h))
+            elif line.startswith('PGON'):
+                parts = line.split()
+                # PGON N M1 x1 y1 x2 y2 ...
+                coords = [float(v) for v in parts[3:]]
+                points = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+                pgons.append(points)
+
+    # collect all points to find bounding box
+    all_x, all_y = [], []
+    for x, y, w, h in rects:
+        all_x.extend([x, x + w])
+        all_y.extend([y, y + h])
+    for pts in pgons:
+        for px, py in pts:
+            all_x.append(px)
+            all_y.append(py)
+
+    x_min = min(all_x) - padding * nm_per_pixel
+    y_min = min(all_y) - padding * nm_per_pixel
+    x_max = max(all_x) + padding * nm_per_pixel
+    y_max = max(all_y) + padding * nm_per_pixel
+
+    width = int(np.ceil((x_max - x_min) / nm_per_pixel))
+    height = int(np.ceil((y_max - y_min) / nm_per_pixel))
+    mask = np.zeros((height, width), dtype=np.float64)
+
+    # rasterize rectangles
+    from PIL import ImageDraw
+    img = Image.new('L', (width, height), 0)
+    draw = ImageDraw.Draw(img)
+
+    for x, y, w, h in rects:
+        px1 = (x - x_min) / nm_per_pixel
+        py1 = (y - y_min) / nm_per_pixel
+        px2 = (x + w - x_min) / nm_per_pixel
+        py2 = (y + h - y_min) / nm_per_pixel
+        draw.rectangle([px1, py1, px2, py2], fill=255)
+
+    for pts in pgons:
+        coords = [((px - x_min) / nm_per_pixel, (py - y_min) / nm_per_pixel) for px, py in pts]
+        draw.polygon(coords, fill=255)
+
+    mask = np.array(img, dtype=np.float64) / 255.0
+    print(f"Loaded GLP: {filename} -> {width} x {height} pixels "
+          f"({nm_per_pixel} nm/px, {len(rects)} rects, {len(pgons)} pgons)")
+    return mask
+
+
 def load_mask(filename, layer=None, nm_per_pixel=1.0, padding=20):
     """Auto-detect format and load mask."""
     ext = os.path.splitext(filename)[1].lower()
@@ -132,6 +200,8 @@ def load_mask(filename, layer=None, nm_per_pixel=1.0, padding=20):
         mask, origin = load_gds(filename, layer=layer,
                                 nm_per_pixel=nm_per_pixel, padding=padding)
         return mask
+    elif ext == '.glp':
+        return load_glp(filename, nm_per_pixel=nm_per_pixel, padding=padding)
     else:
         return load_bitmap_mask(filename)
 
@@ -476,6 +546,165 @@ def save_binary(filename, data):
 
 
 # ======================================================================
+# Mask to GDS (vectorization)
+# ======================================================================
+
+def _simplify_polygon(points, tolerance):
+    """Simplify a polygon using the Ramer-Douglas-Peucker algorithm."""
+    if len(points) < 3:
+        return points
+
+    # find the point farthest from the line between first and last
+    start, end = points[0], points[-1]
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+
+    if line_len < 1e-10:
+        dists = np.linalg.norm(points - start, axis=1)
+    else:
+        line_unit = line_vec / line_len
+        proj = np.dot(points - start, line_unit)
+        closest = start + np.outer(proj, line_unit)
+        dists = np.linalg.norm(points - closest, axis=1)
+
+    max_idx = np.argmax(dists)
+    max_dist = dists[max_idx]
+
+    if max_dist > tolerance:
+        left = _simplify_polygon(points[:max_idx + 1], tolerance)
+        right = _simplify_polygon(points[max_idx:], tolerance)
+        return np.vstack([left[:-1], right])
+    else:
+        return np.array([start, end])
+
+
+def _rectilinearize(points, snap_threshold=0.5):
+    """Snap near-axis-aligned edges to be exactly rectilinear.
+
+    For each edge, if the dx or dy component is small relative to the
+    other, snap it to zero.  This produces Manhattan geometry preferred
+    by mask shops.
+    """
+    result = points.copy()
+    n = len(result)
+    for i in range(n):
+        j = (i + 1) % n
+        dx = abs(result[j, 0] - result[i, 0])
+        dy = abs(result[j, 1] - result[i, 1])
+        edge_len = max(dx, dy, 1e-10)
+        if dx / edge_len < snap_threshold:
+            avg_x = (result[i, 0] + result[j, 0]) / 2
+            result[i, 0] = avg_x
+            result[j, 0] = avg_x
+        if dy / edge_len < snap_threshold:
+            avg_y = (result[i, 1] + result[j, 1]) / 2
+            result[i, 1] = avg_y
+            result[j, 1] = avg_y
+    return result
+
+
+def mask_to_polygons(mask, nm_per_pixel=1.0, origin=(0.0, 0.0),
+                     simplify_tolerance=1.0, rectilinear=True):
+    """Convert a binary mask to a list of polygon coordinate arrays.
+
+    Uses marching squares to find contours, then simplifies them.
+
+    Parameters
+    ----------
+    mask : ndarray (2D)
+        Binary mask (>0.5 = feature).
+    nm_per_pixel : float
+        Pixel size in nm (for coordinate scaling).
+    origin : tuple (x_nm, y_nm)
+        World-coordinate offset of pixel (0,0).
+    simplify_tolerance : float
+        Douglas-Peucker simplification tolerance in pixels.
+        Higher = fewer vertices = simpler shapes.
+    rectilinear : bool
+        If True, snap near-Manhattan edges to exact Manhattan.
+
+    Returns
+    -------
+    polygons : list of ndarray, each shape (N, 2) in nm coordinates.
+    """
+    binary = (mask > 0.5).astype(np.float64)
+    # pad to ensure closed contours at boundaries
+    padded = np.pad(binary, 1, mode='constant', constant_values=0)
+    contours = measure.find_contours(padded, 0.5)
+
+    polygons = []
+    for contour in contours:
+        # remove padding offset, contour is (row, col) = (y, x)
+        pts = contour - 1.0  # undo padding
+
+        if simplify_tolerance > 0:
+            pts = _simplify_polygon(pts, simplify_tolerance)
+
+        if len(pts) < 3:
+            continue
+
+        if rectilinear:
+            pts = _rectilinearize(pts)
+
+        # convert from (row, col) pixel coords to (x_nm, y_nm)
+        xy_nm = np.column_stack([
+            pts[:, 1] * nm_per_pixel + origin[0],
+            pts[:, 0] * nm_per_pixel + origin[1],
+        ])
+        polygons.append(xy_nm)
+
+    return polygons
+
+
+def save_gds(filename, polygons, layer=0, datatype=0, cell_name='TOP',
+             units=(1e-9, 1e-12)):
+    """Write polygons to a GDS file.
+
+    Parameters
+    ----------
+    filename : str
+        Output .gds path.
+    polygons : list of ndarray
+        Polygon vertices in nm coordinates.
+    layer : int
+        GDS layer number.
+    datatype : int
+        GDS datatype.
+    cell_name : str
+        Top cell name.
+    units : tuple
+        (user_unit, db_unit) in meters. Default: 1nm user, 1pm database.
+    """
+    import gdstk
+
+    lib = gdstk.Library(unit=units[0], precision=units[1])
+    cell = lib.new_cell(cell_name)
+
+    for poly_nm in polygons:
+        # gdstk uses library units; with unit=1e-9, coordinates are in nm
+        cell.add(gdstk.Polygon(poly_nm, layer=layer, datatype=datatype))
+
+    lib.write_gds(filename)
+    print(f"Saved GDS: {filename} ({len(polygons)} polygons, layer {layer}/{datatype})")
+
+
+def polygon_complexity(polygons):
+    """Compute a shape complexity metric for a set of polygons.
+
+    Returns a score where lower = simpler/more manufacturable:
+        total_vertices + polygon_count * 4
+
+    This penalizes both many polygons and complex polygon shapes.
+    Rectangles (4 vertices) are cheapest.
+    """
+    if not polygons:
+        return 0
+    total_verts = sum(len(p) for p in polygons)
+    n_polys = len(polygons)
+    return total_verts + n_polys * 4
+
+
+# ======================================================================
 # Mask metrics (for OPC)
 # ======================================================================
 
@@ -511,6 +740,7 @@ INITIAL_TEMP = 50000
 FINAL_TEMP = 1.0
 ERROR_WEIGHT = 1.0
 COMPLEXITY_WEIGHT = 3.0
+SHAPE_WEIGHT = 1.0  # polygon/vertex simplicity penalty
 CLIMB_WEIGHT = 50.0
 
 
@@ -523,8 +753,34 @@ def _schedule(temp):
         return 0.98 * temp
 
 
-def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2, rng=None):
+def _compute_opc_cost(opced_mask, target, compute_aerial_fn, threshold,
+                      initial_error, optimal_complexity, initial_shape_cost,
+                      simplify_tolerance=2.0):
+    """Compute the full OPC cost including pixel error, transition complexity,
+    and polygon shape simplicity."""
+    aerial = compute_aerial_fn(opced_mask)
+    contour = (aerial > threshold).astype(np.float64)
+    err = mask_diff(contour, target) / initial_error
+    cplx = mask_complexity(opced_mask) / optimal_complexity
+
+    # shape cost: evaluated less frequently (expensive), so cache-friendly
+    # polygon complexity encourages fewer, simpler (rectangular) shapes
+    polys = mask_to_polygons(opced_mask, simplify_tolerance=simplify_tolerance)
+    shape = polygon_complexity(polys) / max(initial_shape_cost, 1)
+
+    return (ERROR_WEIGHT * err +
+            COMPLEXITY_WEIGHT * cplx +
+            SHAPE_WEIGHT * shape)
+
+
+def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2,
+           simplify_tolerance=2.0, rng=None):
     """Pixel-based OPC via simulated annealing.
+
+    The cost function balances three terms:
+    1. Aerial image error vs target (pixel accuracy)
+    2. Pixel-level transition complexity (fewer transitions = smoother)
+    3. Polygon shape simplicity (fewer polygons, fewer vertices)
 
     Parameters
     ----------
@@ -536,6 +792,8 @@ def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2, rng=None):
         Function: mask -> aerial_image.
     threshold : float
         Resist threshold.
+    simplify_tolerance : float
+        Douglas-Peucker tolerance for polygon simplification (pixels).
     """
     if rng is None:
         rng = np.random.default_rng(2)
@@ -547,27 +805,47 @@ def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2, rng=None):
 
     initial_error = max(mask_diff(contour, target), 1)
     optimal_complexity = max(mask_complexity(opced_mask), 1)
-    old_cost = ERROR_WEIGHT + COMPLEXITY_WEIGHT
+    initial_polys = mask_to_polygons(opced_mask, simplify_tolerance=simplify_tolerance)
+    initial_shape_cost = max(polygon_complexity(initial_polys), 1)
+
+    old_cost = ERROR_WEIGHT + COMPLEXITY_WEIGHT + SHAPE_WEIGHT
 
     temperature = INITIAL_TEMP
     accept = climb = reject = 0
     counter = 20
+    # full shape cost is expensive; compute it every N outer iterations
+    shape_eval_interval = 5
+    shape_counter = 0
+    cached_shape_cost = 1.0  # normalized
 
-    print(f"OPC: initial error={initial_error}  complexity={optimal_complexity}")
+    print(f"OPC: initial error={initial_error}  complexity={optimal_complexity}  "
+          f"shape_cost={initial_shape_cost}")
 
     while temperature > FINAL_TEMP:
         coarseness = 4 if temperature > 5000 else 3 if temperature > 1000 else 2 if temperature > 100 else 1
 
         if counter == 20:
             cur_err = mask_diff((compute_aerial_fn(opced_mask) > threshold).astype(np.float64), target)
+            cur_polys = mask_to_polygons(opced_mask, simplify_tolerance=simplify_tolerance)
+            cur_shape = polygon_complexity(cur_polys)
+            cached_shape_cost = cur_shape / max(initial_shape_cost, 1)
             print(f"\nT={temperature:.1e} sz={coarseness} "
-                  f"acc={accept} clmb={climb} rej={reject} err={cur_err} cost={old_cost:.3f}")
+                  f"acc={accept} clmb={climb} rej={reject} err={cur_err} "
+                  f"shapes={len(cur_polys)} verts={sum(len(p) for p in cur_polys)} "
+                  f"cost={old_cost:.3f}")
             counter = 0
             accept = climb = reject = 0
         else:
             counter += 1
 
         print(".", end="", flush=True)
+
+        # periodically update shape cost
+        shape_counter += 1
+        if shape_counter >= shape_eval_interval:
+            polys = mask_to_polygons(opced_mask, simplify_tolerance=simplify_tolerance)
+            cached_shape_cost = polygon_complexity(polys) / max(initial_shape_cost, 1)
+            shape_counter = 0
 
         for _ in range(1000):
             while True:
@@ -582,7 +860,8 @@ def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2, rng=None):
             new_aerial = compute_aerial_fn(opced_mask)
             new_contour = (new_aerial > threshold).astype(np.float64)
             new_cost = (ERROR_WEIGHT * mask_diff(new_contour, target) / initial_error +
-                        COMPLEXITY_WEIGHT * mask_complexity(opced_mask) / optimal_complexity)
+                        COMPLEXITY_WEIGHT * mask_complexity(opced_mask) / optimal_complexity +
+                        SHAPE_WEIGHT * cached_shape_cost)
             delta_c = new_cost - old_cost
 
             if delta_c < 0:
@@ -597,8 +876,11 @@ def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2, rng=None):
 
         temperature = _schedule(temperature)
 
-    final_err = mask_diff((compute_aerial_fn(opced_mask) > threshold).astype(np.float64), target)
-    print(f"\nOPC done: error={final_err} complexity={mask_complexity(opced_mask)}")
+    final_contour = (compute_aerial_fn(opced_mask) > threshold).astype(np.float64)
+    final_polys = mask_to_polygons(opced_mask, simplify_tolerance=simplify_tolerance)
+    print(f"\nOPC done: error={mask_diff(final_contour, target)} "
+          f"shapes={len(final_polys)} verts={sum(len(p) for p in final_polys)} "
+          f"complexity={mask_complexity(opced_mask)}")
     return opced_mask
 
 
@@ -820,12 +1102,26 @@ Examples:
         opced_mask = sim.opc(mask)
         save_binary(f"{args.output_prefix}_opc_mask.pbm", (opced_mask > 0.5).astype(np.uint8))
         aerial, resist, contour = sim.simulate(opced_mask)
+        # export OPC mask as GDS
+        polys = mask_to_polygons(opced_mask, nm_per_pixel=args.nm_per_pixel,
+                                 simplify_tolerance=2.0, rectilinear=True)
+        out_layer = parse_layer(args.layer) if args.layer else (0, 0)
+        save_gds(f"{args.output_prefix}_opc_mask.gds", polys,
+                 layer=out_layer[0], datatype=out_layer[1])
     else:
         aerial, resist, contour = sim.simulate(mask)
 
     save_image(f"{args.output_prefix}_aerial.png", aerial)
     save_image(f"{args.output_prefix}_resist.png", resist)
     save_binary(f"{args.output_prefix}_contour.pbm", contour)
+
+    # also export contour as GDS
+    contour_polys = mask_to_polygons(contour.astype(np.float64),
+                                     nm_per_pixel=args.nm_per_pixel,
+                                     simplify_tolerance=1.0, rectilinear=True)
+    out_layer = parse_layer(args.layer) if args.layer else (0, 0)
+    save_gds(f"{args.output_prefix}_contour.gds", contour_polys,
+             layer=out_layer[0], datatype=out_layer[1])
 
     print(f"Total: {time.time()-t0:.2f}s")
 
