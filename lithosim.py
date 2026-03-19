@@ -1097,30 +1097,50 @@ Examples:
     )
 
     os.makedirs(os.path.dirname(args.output_prefix) or '.', exist_ok=True)
+    out_layer = parse_layer(args.layer) if args.layer else (0, 0)
 
     if args.opc:
         opced_mask = sim.opc(mask)
-        save_binary(f"{args.output_prefix}_opc_mask.pbm", (opced_mask > 0.5).astype(np.uint8))
-        aerial, resist, contour = sim.simulate(opced_mask)
-        # export OPC mask as GDS
-        polys = mask_to_polygons(opced_mask, nm_per_pixel=args.nm_per_pixel,
-                                 simplify_tolerance=2.0, rectilinear=True)
-        out_layer = parse_layer(args.layer) if args.layer else (0, 0)
-        save_gds(f"{args.output_prefix}_opc_mask.gds", polys,
-                 layer=out_layer[0], datatype=out_layer[1])
+        sim_mask = opced_mask
     else:
-        aerial, resist, contour = sim.simulate(mask)
+        sim_mask = mask
+
+    # Vectorize the mask to GDS polygons
+    mask_polys = mask_to_polygons(sim_mask, nm_per_pixel=args.nm_per_pixel,
+                                  simplify_tolerance=2.0, rectilinear=True)
+    save_gds(f"{args.output_prefix}_mask.gds", mask_polys,
+             layer=out_layer[0], datatype=out_layer[1])
+
+    # Re-rasterize from the polygon mask for simulation
+    # This is the mask that would actually be manufactured
+    h, w = sim_mask.shape
+    poly_mask = np.zeros((h, w), dtype=np.float64)
+    from PIL import ImageDraw
+    img = Image.new('L', (w, h), 0)
+    draw = ImageDraw.Draw(img)
+    for poly_nm in mask_polys:
+        # convert nm back to pixel coordinates
+        px = poly_nm[:, 0] / args.nm_per_pixel
+        py = poly_nm[:, 1] / args.nm_per_pixel
+        coords = list(zip(px.tolist(), py.tolist()))
+        draw.polygon(coords, fill=255)
+    poly_mask = np.array(img, dtype=np.float64) / 255.0
+
+    print(f"Mask: {len(mask_polys)} polygons, "
+          f"{sum(len(p) for p in mask_polys)} total vertices")
+
+    # Simulate using the polygon-based mask (what the fab would print)
+    aerial, resist, contour = sim.simulate(poly_mask)
 
     save_image(f"{args.output_prefix}_aerial.png", aerial)
     save_image(f"{args.output_prefix}_resist.png", resist)
     save_binary(f"{args.output_prefix}_contour.pbm", contour)
 
-    # also export contour as GDS
+    # Export printed contour as GDS
     contour_polys = mask_to_polygons(contour.astype(np.float64),
                                      nm_per_pixel=args.nm_per_pixel,
-                                     simplify_tolerance=1.0, rectilinear=True)
-    out_layer = parse_layer(args.layer) if args.layer else (0, 0)
-    save_gds(f"{args.output_prefix}_contour.gds", contour_polys,
+                                     simplify_tolerance=1.0, rectilinear=False)
+    save_gds(f"{args.output_prefix}_printed.gds", contour_polys,
              layer=out_layer[0], datatype=out_layer[1])
 
     print(f"Total: {time.time()-t0:.2f}s")
