@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.o
+lithosim
+results/
+jinc.pnm
