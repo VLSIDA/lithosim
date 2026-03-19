@@ -535,6 +535,48 @@ def save_image(filename, data, normalize=True):
     print(f"Saved {w} x {h}: {filename}")
 
 
+def _save_overlay(filename, design, contour, aerial):
+    """Save an overlay image showing design edges vs printed contour.
+
+    Background is the aerial image (grayscale). Design edges drawn in
+    green, printed contour edges in red. Where they overlap = yellow.
+    """
+    h, w = design.shape
+
+    # normalize aerial to grayscale
+    mn, mx = aerial.min(), aerial.max()
+    if mx - mn > 0:
+        gray = ((aerial - mn) / (mx - mn) * 200).astype(np.uint8)
+    else:
+        gray = np.full((h, w), 100, dtype=np.uint8)
+
+    rgb = np.stack([gray, gray, gray], axis=-1)
+
+    # find design edges
+    d = (design > 0.5).astype(np.uint8)
+    d_pad = np.pad(d, 1, mode='constant')
+    d_edge = (d == 1) & ((d_pad[:-2, 1:-1] + d_pad[2:, 1:-1] +
+                           d_pad[1:-1, :-2] + d_pad[1:-1, 2:]) < 4)
+
+    # find contour edges
+    c = (contour > 0.5).astype(np.uint8)
+    c_pad = np.pad(c, 1, mode='constant')
+    c_edge = (c == 1) & ((c_pad[:-2, 1:-1] + c_pad[2:, 1:-1] +
+                           c_pad[1:-1, :-2] + c_pad[1:-1, 2:]) < 4)
+
+    # draw: green = design edge, red = printed edge, yellow = overlap
+    both = d_edge & c_edge
+    design_only = d_edge & ~c_edge
+    contour_only = c_edge & ~d_edge
+
+    rgb[design_only] = [0, 255, 0]
+    rgb[contour_only] = [255, 0, 0]
+    rgb[both] = [255, 255, 0]
+
+    Image.fromarray(rgb).save(filename)
+    print(f"Saved {w} x {h} overlay: {filename}")
+
+
 def save_binary(filename, data):
     """Save binary mask (1 = feature = black in PBM)."""
     if data.dtype != np.uint8:
@@ -1259,6 +1301,9 @@ Examples:
     os.makedirs(os.path.dirname(args.output_prefix) or '.', exist_ok=True)
     out_layer = parse_layer(args.layer) if args.layer else (0, 0)
 
+    # Save the input design/target mask image
+    save_image(f"{args.output_prefix}_design.png", mask, normalize=False)
+
     if args.opc:
         opced_mask = sim.opc(mask)
         sim_mask = opced_mask
@@ -1274,7 +1319,6 @@ Examples:
     # Re-rasterize from the polygon mask for simulation
     # This is the mask that would actually be manufactured
     h, w = sim_mask.shape
-    poly_mask = np.zeros((h, w), dtype=np.float64)
     from PIL import ImageDraw
     img = Image.new('L', (w, h), 0)
     draw = ImageDraw.Draw(img)
@@ -1286,6 +1330,9 @@ Examples:
         draw.polygon(coords, fill=255)
     poly_mask = np.array(img, dtype=np.float64) / 255.0
 
+    # Save the manufactured mask image (pixel view of what the GDS contains)
+    save_image(f"{args.output_prefix}_mask.png", poly_mask, normalize=False)
+
     print(f"Mask: {len(mask_polys)} polygons, "
           f"{sum(len(p) for p in mask_polys)} total vertices")
 
@@ -1295,6 +1342,8 @@ Examples:
     save_image(f"{args.output_prefix}_aerial.png", aerial)
     save_image(f"{args.output_prefix}_resist.png", resist)
     save_binary(f"{args.output_prefix}_contour.pbm", contour)
+    save_image(f"{args.output_prefix}_contour.png",
+               contour.astype(np.float64), normalize=False)
 
     # Export printed contour as GDS
     contour_polys = mask_to_polygons(contour.astype(np.float64),
@@ -1309,6 +1358,9 @@ Examples:
     print_epe_summary(epe)
     save_epe_map(f"{args.output_prefix}_epe.png", mask, epe,
                  nm_per_pixel=args.nm_per_pixel)
+
+    # Save overlay: design edges on top of contour for visual comparison
+    _save_overlay(f"{args.output_prefix}_overlay.png", mask, contour, aerial)
 
     print(f"Total: {time.time()-t0:.2f}s")
 
