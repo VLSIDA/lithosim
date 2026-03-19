@@ -705,6 +705,166 @@ def polygon_complexity(polygons):
 
 
 # ======================================================================
+# Edge Placement Error (EPE)
+# ======================================================================
+
+def find_edges(mask):
+    """Find edge pixels and their outward normal directions.
+
+    Returns arrays of (y, x) positions and (ny, nx) unit normals
+    for every pixel on the boundary of mask features.
+    """
+    binary = (mask > 0.5).astype(np.uint8)
+    padded = np.pad(binary, 1, mode='constant', constant_values=0)
+
+    # edge pixel = feature pixel with at least one non-feature 4-neighbor
+    center = padded[1:-1, 1:-1]
+    neighbor_sum = (padded[:-2, 1:-1] + padded[2:, 1:-1] +
+                    padded[1:-1, :-2] + padded[1:-1, 2:])
+    edge_mask = (center == 1) & (neighbor_sum < 4)
+
+    ys, xs = np.where(edge_mask)
+
+    # compute outward normal as gradient of the distance field
+    # (points from feature interior toward exterior)
+    from scipy.ndimage import distance_transform_edt
+    dist_outside = distance_transform_edt(1 - binary)
+    dist_inside = distance_transform_edt(binary)
+    # signed distance: positive outside, negative inside
+    sdf = dist_outside - dist_inside
+
+    # gradient of SDF gives outward normal
+    gy, gx = np.gradient(sdf)
+    mag = np.sqrt(gx**2 + gy**2)
+    mag = np.where(mag > 0, mag, 1.0)
+    nx = gx / mag
+    ny = gy / mag
+
+    return ys, xs, ny[ys, xs], nx[ys, xs]
+
+
+def compute_epe(target_mask, printed_contour, nm_per_pixel=1.0):
+    """Compute Edge Placement Error between target design and printed contour.
+
+    For each edge pixel in the target, measures the signed distance to the
+    nearest printed contour edge along the local normal direction.
+
+    Parameters
+    ----------
+    target_mask : ndarray (2D)
+        Target/design mask (binary, >0.5 = feature).
+    printed_contour : ndarray (2D)
+        Printed contour from simulation (binary, >0.5 = feature).
+    nm_per_pixel : float
+        Pixel size in nm for converting to physical units.
+
+    Returns
+    -------
+    epe : dict with keys:
+        'positions' : ndarray (N, 2) — (y, x) pixel coords of measurement sites
+        'normals'   : ndarray (N, 2) — (ny, nx) outward normal at each site
+        'errors_nm' : ndarray (N,)   — signed EPE in nm (positive = printed too wide)
+        'mean_nm'   : float — mean signed EPE
+        'rms_nm'    : float — RMS EPE
+        'max_nm'    : float — max absolute EPE
+        'p2p_nm'    : float — peak-to-peak (max - min) EPE
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    target_bin = (target_mask > 0.5).astype(np.uint8)
+    printed_bin = (printed_contour > 0.5).astype(np.uint8)
+
+    # find target edge pixels and normals
+    ys, xs, nys, nxs = find_edges(target_mask)
+
+    if len(ys) == 0:
+        return {
+            'positions': np.empty((0, 2)),
+            'normals': np.empty((0, 2)),
+            'errors_nm': np.empty(0),
+            'mean_nm': 0.0, 'rms_nm': 0.0, 'max_nm': 0.0, 'p2p_nm': 0.0,
+        }
+
+    # signed distance field of the printed contour
+    # positive outside printed features, negative inside
+    dist_outside = distance_transform_edt(1 - printed_bin).astype(np.float64)
+    dist_inside = distance_transform_edt(printed_bin).astype(np.float64)
+    printed_sdf = dist_outside - dist_inside
+
+    # EPE = signed distance at target edge, projected along normal
+    # If the printed contour is wider than target, the target edge sits
+    # inside the printed region → negative SDF → positive EPE (too wide)
+    raw_dist = printed_sdf[ys, xs]
+
+    # sign convention: positive EPE = printed edge is outward of target
+    # (feature is wider than intended)
+    errors_px = -raw_dist  # negate: inside printed = negative SDF = too wide = positive EPE
+    errors_nm = errors_px * nm_per_pixel
+
+    mean_nm = float(np.mean(errors_nm))
+    rms_nm = float(np.sqrt(np.mean(errors_nm**2)))
+    max_nm = float(np.max(np.abs(errors_nm)))
+    p2p_nm = float(np.max(errors_nm) - np.min(errors_nm))
+
+    return {
+        'positions': np.column_stack([ys, xs]),
+        'normals': np.column_stack([nys, nxs]),
+        'errors_nm': errors_nm,
+        'mean_nm': mean_nm,
+        'rms_nm': rms_nm,
+        'max_nm': max_nm,
+        'p2p_nm': p2p_nm,
+    }
+
+
+def save_epe_map(filename, target_mask, epe_result, nm_per_pixel=1.0):
+    """Save a visualization of EPE as a color-mapped image.
+
+    Blue = printed too narrow, Red = printed too wide, Green = on target.
+    """
+    h, w = target_mask.shape
+    # create RGB image
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # background: dark gray for features, light gray for clear
+    rgb[target_mask > 0.5] = [60, 60, 60]
+    rgb[target_mask <= 0.5] = [200, 200, 200]
+
+    positions = epe_result['positions']
+    errors = epe_result['errors_nm']
+
+    if len(errors) == 0:
+        Image.fromarray(rgb).save(filename)
+        return
+
+    max_err = max(epe_result['max_nm'], 1.0)
+
+    for i in range(len(errors)):
+        y, x = int(positions[i, 0]), int(positions[i, 1])
+        if 0 <= y < h and 0 <= x < w:
+            e = errors[i] / max_err  # normalize to [-1, 1]
+            e = max(-1.0, min(1.0, e))
+            if e > 0:  # too wide → red
+                rgb[y, x] = [int(255 * e), int(255 * (1 - e)), 0]
+            else:  # too narrow → blue
+                rgb[y, x] = [0, int(255 * (1 + e)), int(255 * (-e))]
+
+    Image.fromarray(rgb).save(filename)
+    print(f"Saved {w} x {h} EPE map: {filename}")
+
+
+def print_epe_summary(epe_result, label=""):
+    """Print a summary of EPE statistics."""
+    prefix = f"[{label}] " if label else ""
+    n = len(epe_result['errors_nm'])
+    print(f"{prefix}EPE: {n} measurement sites")
+    print(f"{prefix}  Mean:  {epe_result['mean_nm']:+.2f} nm")
+    print(f"{prefix}  RMS:   {epe_result['rms_nm']:.2f} nm")
+    print(f"{prefix}  Max:   {epe_result['max_nm']:.2f} nm")
+    print(f"{prefix}  P2P:   {epe_result['p2p_nm']:.2f} nm")
+
+
+# ======================================================================
 # Mask metrics (for OPC)
 # ======================================================================
 
@@ -1142,6 +1302,13 @@ Examples:
                                      simplify_tolerance=1.0, rectilinear=False)
     save_gds(f"{args.output_prefix}_printed.gds", contour_polys,
              layer=out_layer[0], datatype=out_layer[1])
+
+    # Compute and report EPE (target mask vs printed contour)
+    epe = compute_epe(mask, contour.astype(np.float64),
+                      nm_per_pixel=args.nm_per_pixel)
+    print_epe_summary(epe)
+    save_epe_map(f"{args.output_prefix}_epe.png", mask, epe,
+                 nm_per_pixel=args.nm_per_pixel)
 
     print(f"Total: {time.time()-t0:.2f}s")
 
