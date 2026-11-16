@@ -1053,7 +1053,7 @@ def anneal(opced_mask, target, compute_aerial_fn, threshold=0.2,
             while True:
                 x, y = rng.integers(0, w), rng.integers(0, h)
                 nc = neighbor_count_8(opced_mask, x, y)
-                if rng.random() >= (9.0 - nc * 0.1):
+                if rng.random() >= ((9.0 - nc) * 0.1):
                     break
 
             x2, y2 = min(w, x + 3), min(h, y + 3)
